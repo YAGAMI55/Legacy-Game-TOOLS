@@ -1,2 +1,2 @@
-go build -o gow2repaker.exe
+go build -o gow2repacker.exe
 pause

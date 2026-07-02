@@ -9,27 +9,42 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
-	"time"
 )
 
+// ---------- Константы ----------
 const (
 	SectorSize   = 2048
 	TocLbaOffset = 0x8068
 	EntrySize    = 36
 	NameLen      = 24
 	HeaderSize   = 4
+	SPLITLINE    = 10000000 // для DVD9
 )
 
+// ---------- Структуры ----------
+type TOCEntry struct {
+	Filename  [24]byte
+	Size      uint32
+	ArchiveID uint32
+	OffsetID  uint32
+}
+
+type FileInfo struct {
+	Name      string
+	Size      uint32
+	RawOffset uint32
+}
+
 type Entry struct {
-	Name      string `json:"name"`
-	Size      uint32 `json:"size"`
-	ArchiveID uint32 `json:"archiveId"`
-	OffsetID  uint32 `json:"offsetId"`
-	Lba       uint32 `json:"lba"`
-	Pak       string `json:"pak"`
-	Offset    int64  `json:"offset"`
+	Name           string `json:"name"`
+	Size           uint32 `json:"size"`
+	ArchiveID      uint32 `json:"archiveId"`
+	OffsetID       uint32 `json:"offsetId"`
+	Lba            uint32 `json:"lba"`
+	Pak            string `json:"pak"`
+	Offset         int64  `json:"offset"`
+	ComputedOffset int64  `json:"computedOffset"`
 }
 
 type Metadata struct {
@@ -37,20 +52,12 @@ type Metadata struct {
 	Entries   []Entry `json:"entries"`
 }
 
-func printProgress(current, total int, prefix string) {
-	if total == 0 {
-		return
-	}
-	percent := int(float64(current) / float64(total) * 100)
-	msg := fmt.Sprintf("%s: %d%% (%d/%d)", prefix, percent, current, total)
-	log.Print(msg)
-	fmt.Printf("\r%s", msg)
-	os.Stdout.Sync()
-	if current == total {
-		fmt.Println()
-	}
+// ---------- Инициализация логгера (без даты и времени) ----------
+func init() {
+	log.SetFlags(0)
 }
 
+// ---------- Вспомогательные ----------
 func safeNameFromBytes(data []byte) string {
 	var res strings.Builder
 	for _, b := range data {
@@ -69,583 +76,496 @@ func safeNameFromBytes(data []byte) string {
 	return res.String()
 }
 
-func readTOC(tocPath, pak1Path, pak2Path string) (*Metadata, error) {
-	log.Print("Чтение TOC...")
-	data, err := os.ReadFile(tocPath)
-	if err != nil {
-		return nil, fmt.Errorf("чтение TOC: %v", err)
+// ---------- Парсинг TOC ----------
+func parseTOC(data []byte) ([]TOCEntry, int, error) {
+	if len(data) < 4 {
+		return nil, 0, fmt.Errorf("TOC too small")
 	}
-	if len(data) < HeaderSize {
-		return nil, fmt.Errorf("TOC слишком мал")
-	}
-	fileCount := binary.LittleEndian.Uint32(data[:4])
-	meta := &Metadata{FileCount: fileCount, Entries: make([]Entry, fileCount)}
-
-	info1, _ := os.Stat(pak1Path)
-	info2, _ := os.Stat(pak2Path)
-	pak1Size := int64(0)
-	pak2Size := int64(0)
-	if info1 != nil {
-		pak1Size = info1.Size()
-	}
-	if info2 != nil {
-		pak2Size = info2.Size()
-	}
-
-	for i := uint32(0); i < fileCount; i++ {
-		base := HeaderSize + int(i)*EntrySize
-		if base+EntrySize > len(data) {
-			return nil, fmt.Errorf("запись %d выходит за границы", i)
+	count := binary.LittleEndian.Uint32(data[0:4])
+	entries := make([]TOCEntry, 0, count)
+	offset := 4
+	for i := uint32(0); i < count; i++ {
+		if offset+36 > len(data) {
+			return nil, 0, fmt.Errorf("truncated at entry %d", i)
 		}
-		nameBytes := data[base : base+NameLen]
-		end := 0
-		for end < len(nameBytes) && nameBytes[end] != 0 {
-			end++
-		}
-		name := string(nameBytes[:end])
-		size := binary.LittleEndian.Uint32(data[base+NameLen : base+NameLen+4])
-		archiveID := binary.LittleEndian.Uint32(data[base+NameLen+4 : base+NameLen+8])
-		offsetID := binary.LittleEndian.Uint32(data[base+NameLen+8 : base+NameLen+12])
-		meta.Entries[i] = Entry{
-			Name:      name,
-			Size:      size,
-			ArchiveID: archiveID,
-			OffsetID:  offsetID,
-		}
+		var e TOCEntry
+		copy(e.Filename[:], data[offset:offset+24])
+		e.Size = binary.LittleEndian.Uint32(data[offset+24 : offset+28])
+		e.ArchiveID = binary.LittleEndian.Uint32(data[offset+28 : offset+32])
+		e.OffsetID = binary.LittleEndian.Uint32(data[offset+32 : offset+36])
+		entries = append(entries, e)
+		offset += 36
 	}
-
-	lbaStart := TocLbaOffset
-	if len(data) < lbaStart+int(fileCount)*4 {
-		return nil, fmt.Errorf("таблица LBA за пределами")
-	}
-	for i := uint32(0); i < fileCount; i++ {
-		off := lbaStart + int(i)*4
-		lba := binary.LittleEndian.Uint32(data[off : off+4])
-		meta.Entries[i].Lba = lba
-		realOffset := int64(lba) * SectorSize
-		if realOffset < pak1Size {
-			meta.Entries[i].Pak = pak1Path
-			meta.Entries[i].Offset = realOffset
-		} else if realOffset < pak1Size+pak2Size {
-			meta.Entries[i].Pak = pak2Path
-			meta.Entries[i].Offset = realOffset - pak1Size
-		} else {
-			return nil, fmt.Errorf("смещение %d вне обоих PAK", realOffset)
-		}
-	}
-	log.Printf("TOC прочитан, файлов: %d", fileCount)
-	return meta, nil
+	offsetTableStart := 4 + int(count)*36
+	return entries, offsetTableStart, nil
 }
 
-func extractFiles(meta *Metadata, outDir string) error {
-	log.Print("Начало распаковки файлов...")
-	if err := os.MkdirAll(outDir, 0755); err != nil {
+// ---------- Получение информации о файлах ----------
+func getFileInfos(tocData []byte, entries []TOCEntry, offsetTableStart int) []FileInfo {
+	files := make([]FileInfo, 0, len(entries))
+	for _, e := range entries {
+		name := strings.TrimRight(string(e.Filename[:]), "\x00")
+		ptrOffset := offsetTableStart + int(e.OffsetID)*4
+		if ptrOffset+4 > len(tocData) {
+			continue
+		}
+		raw := binary.LittleEndian.Uint32(tocData[ptrOffset : ptrOffset+4])
+		files = append(files, FileInfo{
+			Name:      name,
+			Size:      e.Size,
+			RawOffset: raw,
+		})
+	}
+	return files
+}
+
+// ---------- Распаковка ----------
+func extract(tocPath, pak1Path, pak2Path, outputDir string) error {
+	tocData, err := os.ReadFile(tocPath)
+	if err != nil {
+		return fmt.Errorf("cannot read TOC: %w", err)
+	}
+	entries, offsetTableStart, err := parseTOC(tocData)
+	if err != nil {
+		return fmt.Errorf("parse error: %w", err)
+	}
+	files := getFileInfos(tocData, entries, offsetTableStart)
+
+	pak1, err := os.Open(pak1Path)
+	if err != nil {
+		return fmt.Errorf("cannot open PART1.PAK: %w", err)
+	}
+	defer pak1.Close()
+	pak1Info, _ := pak1.Stat()
+	pak1Size := pak1Info.Size()
+	log.Printf("PART1.PAK size: %d bytes", pak1Size)
+
+	var pak2 *os.File
+	var pak2Size int64
+	usePak2 := pak2Path != "" && strings.ToLower(pak2Path) != "none" && strings.ToLower(pak2Path) != "-"
+	if usePak2 {
+		pak2, err = os.Open(pak2Path)
+		if err != nil {
+			log.Printf("Warning: PART2.PAK not found, skipping files beyond PART1 size.")
+		} else {
+			defer pak2.Close()
+			pak2Info, _ := pak2.Stat()
+			pak2Size = pak2Info.Size()
+			log.Printf("PART2.PAK size: %d bytes", pak2Size)
+		}
+	}
+
+	if err := os.MkdirAll(outputDir, 0755); err != nil {
 		return err
 	}
-	handles := make(map[string]*os.File)
-	defer func() {
-		for _, f := range handles {
-			f.Close()
-		}
-	}()
 
-	total := len(meta.Entries)
-	for i, entry := range meta.Entries {
-		printProgress(i+1, total, "Распаковка")
+	extracted := 0
+	skipped := 0
 
-		if _, ok := handles[entry.Pak]; !ok {
-			f, err := os.Open(entry.Pak)
-			if err != nil {
-				return fmt.Errorf("открытие %s: %v", entry.Pak, err)
+	nameToEntry := make(map[string]TOCEntry)
+	for _, e := range entries {
+		name := strings.TrimRight(string(e.Filename[:]), "\x00")
+		nameToEntry[name] = e
+	}
+
+	meta := &Metadata{
+		FileCount: uint32(len(files)),
+		Entries:   make([]Entry, 0, len(files)),
+	}
+
+	for i, file := range files {
+		var pakFile *os.File
+		var offsetInPak int64
+		var fileSizeLimit int64
+		var pakName string
+		var rawOffset = file.RawOffset
+		var computedOffset int64
+
+		if rawOffset >= SPLITLINE {
+			if pak2 == nil {
+				log.Printf("Skipping %s (needs PART2.PAK)", file.Name)
+				skipped++
+				continue
 			}
-			handles[entry.Pak] = f
+			pakFile = pak2
+			computedOffset = int64(rawOffset%SPLITLINE) * SectorSize
+			offsetInPak = computedOffset
+			fileSizeLimit = pak2Size
+			pakName = "PART2.PAK"
+		} else {
+			pakFile = pak1
+			computedOffset = int64(rawOffset) * SectorSize
+			offsetInPak = computedOffset
+			fileSizeLimit = pak1Size
+			pakName = "PART1.PAK"
 		}
-		src := handles[entry.Pak]
-		safeName := safeNameFromBytes([]byte(entry.Name))
-		outPath := filepath.Join(outDir, safeName)
+
+		if offsetInPak+int64(file.Size) > fileSizeLimit {
+			log.Printf("Warning: %s offset %d + size %d exceeds %s size %d, skipping",
+				file.Name, offsetInPak, file.Size, pakName, fileSizeLimit)
+			skipped++
+			continue
+		}
+
+		data := make([]byte, file.Size)
+		if _, err := pakFile.ReadAt(data, offsetInPak); err != nil {
+			log.Printf("Error reading %s at offset %d: %v, skipping", file.Name, offsetInPak, err)
+			skipped++
+			continue
+		}
+
+		safeName := safeNameFromBytes([]byte(file.Name))
+		outPath := filepath.Join(outputDir, safeName)
 		if err := os.MkdirAll(filepath.Dir(outPath), 0755); err != nil {
 			return err
 		}
-		dst, err := os.Create(outPath)
-		if err != nil {
-			return err
+		if err := os.WriteFile(outPath, data, 0644); err != nil {
+			log.Printf("Error writing %s: %v, skipping", outPath, err)
+			skipped++
+			continue
 		}
-		_, err = src.Seek(entry.Offset, io.SeekStart)
-		if err != nil {
-			dst.Close()
-			return err
-		}
-		_, err = io.CopyN(dst, src, int64(entry.Size))
-		dst.Close()
-		if err != nil {
-			return err
-		}
+
+		log.Printf("[%d/%d] Распаковано: %s (%d bytes) from %s, rawOffset=%d, computedOffset=%d",
+			i+1, len(files), file.Name, file.Size, pakName, rawOffset, computedOffset)
+		extracted++
+
+		e := nameToEntry[file.Name]
+		meta.Entries = append(meta.Entries, Entry{
+			Name:           file.Name,
+			Size:           file.Size,
+			ArchiveID:      e.ArchiveID,
+			OffsetID:       e.OffsetID,
+			Lba:            rawOffset,
+			Pak:            pakName,
+			Offset:         offsetInPak,
+			ComputedOffset: computedOffset,
+		})
 	}
-	printProgress(total, total, "Распаковка")
-	log.Print("Распаковка завершена.")
+
+	log.Printf("Done. Extracted %d files, skipped %d.", extracted, skipped)
+
+	metaPath := filepath.Join(outputDir, "_metadata.json")
+	metaData, _ := json.MarshalIndent(meta, "", "  ")
+	if err := os.WriteFile(metaPath, metaData, 0644); err != nil {
+		return fmt.Errorf("cannot save metadata: %w", err)
+	}
+	log.Printf("Metadata saved to %s", metaPath)
+
 	return nil
 }
 
-func saveMetadata(meta *Metadata, outDir string) error {
-	log.Print("Сохранение метаданных...")
-	path := filepath.Join(outDir, "_metadata.json")
-	data, err := json.MarshalIndent(meta, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(path, data, 0644)
-}
+// ---------- Упаковка (с релинком .psw -> .pss и дедупликацией) ----------
+func pack(inDir, outPak, outToc string, relinkPss bool, dedup bool) error {
+	log.Print("Начало упаковки...")
 
-func loadMetadata(inDir string) (*Metadata, error) {
-	log.Print("Загрузка метаданных...")
-	path := filepath.Join(inDir, "_metadata.json")
-	data, err := os.ReadFile(path)
+	metaPath := filepath.Join(inDir, "_metadata.json")
+	metaData, err := os.ReadFile(metaPath)
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("cannot read metadata: %w", err)
 	}
 	var meta Metadata
-	if err := json.Unmarshal(data, &meta); err != nil {
-		return nil, err
+	if err := json.Unmarshal(metaData, &meta); err != nil {
+		return fmt.Errorf("cannot parse metadata: %w", err)
 	}
 	log.Printf("Метаданные загружены, файлов: %d", meta.FileCount)
-	return &meta, nil
-}
 
-func computeHashFileWithProgress(path string, fileIndex, total int) (uint64, error) {
-	printProgress(fileIndex+1, total, "Хеширование файлов")
-	f, err := os.Open(path)
-	if err != nil {
-		return 0, err
+	type FileInfoPack struct {
+		Entry  Entry
+		Path   string
+		Size   int64
+		Exists bool
 	}
-	defer f.Close()
-	h := crc64.New(crc64.MakeTable(crc64.ECMA))
-	if _, err := io.Copy(h, f); err != nil {
-		return 0, err
-	}
-	return h.Sum64(), nil
-}
-
-func relinkByName(entries []Entry) (map[uint32]uint32, error) {
-	log.Print("Выполнение релинка по имени...")
-	priorityExts := []string{".pss", ".psw"}
-	groups := make(map[string][]int)
-	for i, entry := range entries {
-		base := strings.ToLower(filepath.Base(entry.Name))
-		ext := filepath.Ext(base)
-		isPriority := false
-		for _, p := range priorityExts {
-			if ext == p {
-				isPriority = true
-				break
-			}
-		}
-		var key string
-		if isPriority {
-			key = strings.TrimSuffix(base, ext)
-		} else {
-			key = base
-		}
-		groups[key] = append(groups[key], i)
-	}
-
-	relinkMap := make(map[uint32]uint32)
-	for _, indices := range groups {
-		if len(indices) <= 1 {
-			continue
-		}
-		var bestIdx int
-		bestPriority := -1
-		for _, idx := range indices {
-			ext := strings.ToLower(filepath.Ext(entries[idx].Name))
-			priority := -1
-			for i, p := range priorityExts {
-				if ext == p {
-					priority = i
-					break
-				}
-			}
-			if priority > bestPriority {
-				bestPriority = priority
-				bestIdx = idx
-			}
-		}
-		if bestPriority == -1 {
-			bestIdx = indices[0]
-		}
-		origOffsetID := entries[bestIdx].OffsetID
-		for _, idx := range indices {
-			if idx == bestIdx {
-				continue
-			}
-			dupOffsetID := entries[idx].OffsetID
-			relinkMap[dupOffsetID] = origOffsetID
-		}
-	}
-	log.Printf("Релинг по имени завершён, найдено %d дубликатов", len(relinkMap))
-	return relinkMap, nil
-}
-
-func pack(inDir, outPakPath, outTocPath string, dedup bool, relinkName bool) error {
-	startTime := time.Now()
-	log.Print("=== НАЧАЛО УПАКОВКИ ===")
-
-	meta, err := loadMetadata(inDir)
-	if err != nil {
-		return fmt.Errorf("загрузка метаданных: %v", err)
-	}
-
-	log.Print("Сбор активных файлов...")
-	var activeEntries []Entry
+	var fileInfos []FileInfoPack
 	for _, entry := range meta.Entries {
 		safeName := safeNameFromBytes([]byte(entry.Name))
 		filePath := filepath.Join(inDir, safeName)
 		info, err := os.Stat(filePath)
 		if os.IsNotExist(err) {
+			log.Printf("Файл %s удалён, пропускаем", entry.Name)
 			continue
 		}
 		if err != nil {
 			return err
 		}
-		entry.Size = uint32(info.Size())
-		entry.ArchiveID = 1
-		activeEntries = append(activeEntries, entry)
+		fileInfos = append(fileInfos, FileInfoPack{
+			Entry:  entry,
+			Path:   filePath,
+			Size:   info.Size(),
+			Exists: true,
+		})
+	}
+	if len(fileInfos) == 0 {
+		return fmt.Errorf("нет файлов для упаковки")
+	}
+	log.Printf("Активных файлов: %d", len(fileInfos))
+
+	relinkMap := make(map[int]int) // дубликат -> оригинал
+
+	// 1. Релинк по имени (.psw -> .pss)
+	if relinkPss {
+		log.Print("Включён релинк по имени (.psw -> .pss)")
+		groups := make(map[string][]int)
+		for i, fi := range fileInfos {
+			base := strings.TrimSuffix(fi.Entry.Name, filepath.Ext(fi.Entry.Name))
+			groups[base] = append(groups[base], i)
+		}
+		for _, indices := range groups {
+			if len(indices) <= 1 {
+				continue
+			}
+			bestIdx := indices[0]
+			bestPriority := -1
+			for _, idx := range indices {
+				ext := strings.ToLower(filepath.Ext(fileInfos[idx].Entry.Name))
+				priority := 0
+				if ext == ".pss" {
+					priority = 2
+				} else if ext == ".psw" {
+					priority = 1
+				}
+				if priority > bestPriority {
+					bestPriority = priority
+					bestIdx = idx
+				}
+			}
+			for _, idx := range indices {
+				if idx != bestIdx {
+					relinkMap[idx] = bestIdx
+					log.Printf("Релинк: %s -> %s", fileInfos[idx].Entry.Name, fileInfos[bestIdx].Entry.Name)
+				}
+			}
+		}
 	}
 
-	existingNames := make(map[string]bool)
-	for _, e := range meta.Entries {
-		existingNames[e.Name] = true
+	// 2. Дедупликация по содержимому (CRC64) – исключаем .pss и .psw
+	if dedup {
+		log.Print("Включена дедупликация по содержимому (CRC64)")
+		hashToOrig := make(map[uint64]int)
+		table := crc64.MakeTable(crc64.ECMA)
+
+		for i, fi := range fileInfos {
+			// Если файл уже дубликат по релинку, пропускаем
+			if _, ok := relinkMap[i]; ok {
+				continue
+			}
+			// Исключаем .pss и .psw
+			ext := strings.ToLower(filepath.Ext(fi.Entry.Name))
+			if ext == ".pss" || ext == ".psw" {
+				continue
+			}
+			// Вычисляем CRC64
+			f, err := os.Open(fi.Path)
+			if err != nil {
+				return err
+			}
+			h := crc64.New(table)
+			if _, err := io.Copy(h, f); err != nil {
+				f.Close()
+				return err
+			}
+			f.Close()
+			hash := h.Sum64()
+
+			if origIdx, ok := hashToOrig[hash]; ok {
+				// Найден дубликат
+				relinkMap[i] = origIdx
+				log.Printf("Дедупликация: %s -> %s (CRC64=%x)", fi.Entry.Name, fileInfos[origIdx].Entry.Name, hash)
+			} else {
+				hashToOrig[hash] = i
+			}
+		}
 	}
-	entries, err := os.ReadDir(inDir)
+
+	// 3. Определяем уникальные файлы (оригиналы)
+	uniqueIndices := []int{}
+	seen := make(map[int]bool)
+	for i := range fileInfos {
+		orig := i
+		if val, ok := relinkMap[i]; ok {
+			orig = val
+		}
+		if !seen[orig] {
+			seen[orig] = true
+			uniqueIndices = append(uniqueIndices, orig)
+		}
+	}
+	log.Printf("Уникальных файлов для записи в PAK: %d", len(uniqueIndices))
+
+	// 4. Создаём PAK
+	out, err := os.Create(outPak)
 	if err != nil {
 		return err
 	}
-	for _, e := range entries {
-		if e.IsDir() || e.Name() == "_metadata.json" {
-			continue
-		}
-		found := false
-		for _, entry := range meta.Entries {
-			if safeNameFromBytes([]byte(entry.Name)) == e.Name() {
-				found = true
-				break
-			}
-		}
-		if !found {
-			info, err := e.Info()
-			if err != nil {
+	defer out.Close()
+
+	offsetToLba := make(map[uint32]uint32)
+	currentPos := int64(0)
+	for _, idx := range uniqueIndices {
+		fi := fileInfos[idx]
+		if currentPos%SectorSize != 0 {
+			pad := SectorSize - (currentPos % SectorSize)
+			if _, err := out.Write(make([]byte, pad)); err != nil {
 				return err
 			}
-			newEntry := Entry{
-				Name:      e.Name(),
-				Size:      uint32(info.Size()),
-				ArchiveID: 1,
-				OffsetID:  0,
-			}
-			activeEntries = append(activeEntries, newEntry)
+			currentPos += pad
 		}
-	}
-	log.Printf("Активных файлов: %d", len(activeEntries))
+		lba := uint32(currentPos / SectorSize)
+		offsetToLba[fi.Entry.OffsetID] = lba
 
-	relinkMap := make(map[uint32]uint32)
-	if relinkName {
-		relinkMap, err = relinkByName(activeEntries)
+		src, err := os.Open(fi.Path)
 		if err != nil {
 			return err
 		}
-	}
-
-	dedupMap := make(map[uint32]uint32)
-	if dedup {
-		log.Print("Выполнение дедупликации (хеширование файлов)...")
-		totalFiles := len(activeEntries)
-		hashToIdx := make(map[uint64]int)
-		for i := range activeEntries {
-			entry := &activeEntries[i]
-			safeName := safeNameFromBytes([]byte(entry.Name))
-			filePath := filepath.Join(inDir, safeName)
-			hash, err := computeHashFileWithProgress(filePath, i, totalFiles)
-			if err != nil {
-				return err
-			}
-			if idx, ok := hashToIdx[hash]; ok {
-				origOffset := activeEntries[idx].OffsetID
-				dupOffset := entry.OffsetID
-				dedupMap[dupOffset] = origOffset
-			} else {
-				hashToIdx[hash] = i
-			}
-		}
-		printProgress(totalFiles, totalFiles, "Хеширование файлов")
-		log.Printf("Дедупликация завершена, найдено %d дубликатов", len(dedupMap))
-	}
-
-	finalRedirect := make(map[uint32]uint32)
-	for dup, orig := range relinkMap {
-		finalRedirect[dup] = orig
-	}
-	for dup, orig := range dedupMap {
-		if redirected, ok := finalRedirect[orig]; ok {
-			finalRedirect[dup] = redirected
-		} else {
-			finalRedirect[dup] = orig
-		}
-	}
-
-	// Разрешение цепочек с защитой от циклов
-	finalTarget := make(map[uint32]uint32)
-	for _, entry := range activeEntries {
-		origID := entry.OffsetID
-		visited := make(map[uint32]bool)
-		current := origID
-		for {
-			if visited[current] {
-				// Обнаружен цикл – прерываем, оставляем current как конечный
-				break
-			}
-			visited[current] = true
-			if next, ok := finalRedirect[current]; ok {
-				current = next
-			} else {
-				break
-			}
-		}
-		finalTarget[origID] = current
-	}
-
-	uniqueOffsetIDsSet := make(map[uint32]bool)
-	for _, target := range finalTarget {
-		uniqueOffsetIDsSet[target] = true
-	}
-	var uniqueOffsets []uint32
-	for off := range uniqueOffsetIDsSet {
-		uniqueOffsets = append(uniqueOffsets, off)
-	}
-	sort.Slice(uniqueOffsets, func(i, j int) bool { return uniqueOffsets[i] < uniqueOffsets[j] })
-
-	log.Printf("Уникальных файлов для записи в PAK: %d", len(uniqueOffsets))
-	log.Print("Начинаем запись PAK...")
-
-	outPak, err := os.Create(outPakPath)
-	if err != nil {
-		return fmt.Errorf("ошибка создания PAK: %v", err)
-	}
-	defer outPak.Close()
-
-	offsetToLba := make(map[uint32]uint32)
-	totalUnique := len(uniqueOffsets)
-
-	for i, off := range uniqueOffsets {
-		log.Printf("Цикл %d из %d: обработка OffsetID %d", i+1, totalUnique, off)
-		printProgress(i+1, totalUnique, "Упаковка (запись в PAK)")
-
-		var srcEntry *Entry
-		for idx := range activeEntries {
-			if activeEntries[idx].OffsetID == off {
-				srcEntry = &activeEntries[idx]
-				break
-			}
-		}
-		if srcEntry == nil {
-			return fmt.Errorf("не найден файл для OffsetID %d", off)
-		}
-		log.Printf("  Найдена запись: %s, размер %d", srcEntry.Name, srcEntry.Size)
-
-		cur, _ := outPak.Seek(0, io.SeekCurrent)
-		padding := (SectorSize - (cur % SectorSize)) % SectorSize
-		if padding > 0 {
-			log.Printf("  Добавление выравнивания %d байт", padding)
-			if _, err := outPak.Write(make([]byte, padding)); err != nil {
-				return fmt.Errorf("ошибка записи выравнивания: %v", err)
-			}
-		}
-		newPos, err := outPak.Seek(0, io.SeekCurrent)
-		if err != nil {
-			return fmt.Errorf("ошибка поиска позиции: %v", err)
-		}
-		newLba := uint32(newPos / SectorSize)
-		offsetToLba[off] = newLba
-		log.Printf("  Новый LBA: %d (смещение %d)", newLba, newPos)
-
-		safeName := safeNameFromBytes([]byte(srcEntry.Name))
-		srcPath := filepath.Join(inDir, safeName)
-		log.Printf("  Открытие файла: %s", srcPath)
-
-		if _, err := os.Stat(srcPath); err != nil {
-			return fmt.Errorf("файл %s не существует: %v", srcPath, err)
-		}
-		src, err := os.Open(srcPath)
-		if err != nil {
-			return fmt.Errorf("ошибка открытия %s: %v", srcPath, err)
-		}
-		log.Printf("  Копирование данных...")
-		written, err := io.Copy(outPak, src)
+		written, err := io.Copy(out, src)
 		src.Close()
 		if err != nil {
-			return fmt.Errorf("ошибка копирования %s: %v", srcPath, err)
+			return err
 		}
-		if written != int64(srcEntry.Size) {
-			log.Printf("  Предупреждение: скопировано %d байт, ожидалось %d", written, srcEntry.Size)
-		} else {
-			log.Printf("  Скопировано %d байт", written)
-		}
-		log.Printf("  Файл %s успешно обработан", srcEntry.Name)
+		currentPos += written
+		log.Printf("Упаковано: %s (LBA=%d, размер=%d)", fi.Entry.Name, lba, fi.Size)
 	}
-	printProgress(totalUnique, totalUnique, "Упаковка (запись в PAK)")
-	log.Print("Запись PAK завершена.")
 
-	log.Print("Формирование TOC...")
-	newFileCount := uint32(len(activeEntries))
-	newTocData := make([]byte, HeaderSize)
-	binary.LittleEndian.PutUint32(newTocData, newFileCount)
+	// 5. Подготовка размеров для дубликатов
+	actualSizeMap := make(map[int]int64)
+	for i, fi := range fileInfos {
+		if val, ok := relinkMap[i]; ok {
+			actualSizeMap[i] = fileInfos[val].Size
+			log.Printf("Для дубликата %s установлен размер оригинала %d", fi.Entry.Name, actualSizeMap[i])
+		} else {
+			actualSizeMap[i] = fi.Size
+		}
+	}
 
-	for _, entry := range activeEntries {
-		nameBuf := make([]byte, NameLen)
-		copy(nameBuf, []byte(entry.Name))
-		newTocData = append(newTocData, nameBuf...)
+	// 6. Формируем TOC
+	newFileCount := uint32(len(fileInfos))
+	tocData := make([]byte, HeaderSize)
+	binary.LittleEndian.PutUint32(tocData, newFileCount)
+
+	for i, fi := range fileInfos {
+		nameBytes := make([]byte, NameLen)
+		copy(nameBytes, []byte(fi.Entry.Name))
+		tocData = append(tocData, nameBytes...)
 		sizeBytes := make([]byte, 4)
-		binary.LittleEndian.PutUint32(sizeBytes, entry.Size)
-		newTocData = append(newTocData, sizeBytes...)
+		binary.LittleEndian.PutUint32(sizeBytes, uint32(actualSizeMap[i]))
+		tocData = append(tocData, sizeBytes...)
 		arcBytes := make([]byte, 4)
 		binary.LittleEndian.PutUint32(arcBytes, 1)
-		newTocData = append(newTocData, arcBytes...)
+		tocData = append(tocData, arcBytes...)
 		offBytes := make([]byte, 4)
-		binary.LittleEndian.PutUint32(offBytes, entry.OffsetID)
-		newTocData = append(newTocData, offBytes...)
+		binary.LittleEndian.PutUint32(offBytes, fi.Entry.OffsetID)
+		tocData = append(tocData, offBytes...)
 	}
 
-	if len(newTocData) < TocLbaOffset {
-		padding := make([]byte, TocLbaOffset-len(newTocData))
-		newTocData = append(newTocData, padding...)
-	} else if len(newTocData) > TocLbaOffset {
+	if len(tocData) < TocLbaOffset {
+		pad := make([]byte, TocLbaOffset-len(tocData))
+		tocData = append(tocData, pad...)
+	} else if len(tocData) > TocLbaOffset {
 		return fmt.Errorf("размер TOC превышает 0x8068")
 	}
 
-	fullLbaTable := make([]uint32, newFileCount)
-	for i, entry := range activeEntries {
-		targetOff := finalTarget[entry.OffsetID]
-		if lba, ok := offsetToLba[targetOff]; ok {
-			fullLbaTable[i] = lba
+	// Таблица LBA – для дубликатов используем LBA оригинала
+	for i, fi := range fileInfos {
+		var targetOffsetID uint32
+		if val, ok := relinkMap[i]; ok {
+			targetOffsetID = fileInfos[val].Entry.OffsetID
 		} else {
-			return fmt.Errorf("не найден LBA для конечного OffsetID %d (исходный %d)", targetOff, entry.OffsetID)
+			targetOffsetID = fi.Entry.OffsetID
 		}
-	}
-	for _, lba := range fullLbaTable {
+		lba, ok := offsetToLba[targetOffsetID]
+		if !ok {
+			return fmt.Errorf("не найден LBA для OffsetID %d (исходный %d)", targetOffsetID, fi.Entry.OffsetID)
+		}
 		lbaBytes := make([]byte, 4)
 		binary.LittleEndian.PutUint32(lbaBytes, lba)
-		newTocData = append(newTocData, lbaBytes...)
+		tocData = append(tocData, lbaBytes...)
 	}
 
-	log.Printf("Запись TOC в %s...", outTocPath)
-	if err := os.WriteFile(outTocPath, newTocData, 0644); err != nil {
+	if err := os.WriteFile(outToc, tocData, 0644); err != nil {
 		return err
 	}
-
-	log.Printf("Упаковка завершена за %v", time.Since(startTime))
+	log.Printf("TOC записан: %s", outToc)
+	log.Print("Упаковка завершена.")
 	return nil
 }
 
+// ---------- Справка ----------
 func printUsage() {
-	fmt.Println(`God of War 2 Repacker
+	fmt.Println(`GOW2 DVD9/DVD5 Extractor & Repacker by YAGAMI55
 
 Использование:
-  gow2repacker extract [toc] [pak1] [pak2] [out]
-  gow2repacker pack [in] [outpak] [outtoc] [-dedup] [-relinkname]
-  gow2repacker help
+  extract <GODOFWAR.TOC> <PART1.PAK> [PART2.PAK or 'none'] <OUT_DIR>
+  pack <IN_DIR> <OUT_PAK> <OUT_TOC> [-relinkpss] [-dedup]
+  help
 
 Примеры:
-  gow2repacker extract
-  gow2repacker extract GODOFWAR.TOC PART1.PAK PART2.PAK MY_EXTRACT
-  gow2repacker pack -dedup
-  gow2repacker pack MY_EXTRACT NEW_PART1.PAK NEW_TOC.TOC -relinkname=false
+  # Распаковка DVD5 (только PART1)
+  gow2repacker extract GODOFWAR.TOC PART1.PAK none EXTRACT
+
+  # Распаковка DVD9 (PART1 + PART2)
+  gow2repacker extract GODOFWAR.TOC PART1.PAK PART2.PAK EXTRACT
+
+  # Упаковка с релинком .psw -> .pss
+  gow2repacker pack EXTRACT PART1_NEW.PAK GODOFWAR_NEW.TOC -relinkpss
+
+  # Упаковка с релинком и дедупликацией (CRC64, исключая .pss/.psw)
+  gow2repacker pack EXTRACT PART1_NEW.PAK GODOFWAR_NEW.TOC -relinkpss -dedup
+
+Примечания:
+  - При распаковке автоматически определяется DVD9 (если передан PART2) или DVD5.
+  - Упаковка всегда создаёт один PART1.PAK (все ArchiveID=1).
+  - Релинк (.psw -> .pss) работает по имени без расширения, приоритет .pss > .psw.
+  - Дедупликация объединяет одинаковые файлы по CRC64, но не затрагивает .pss и .psw.
 `)
 }
 
+// ---------- MAIN ----------
 func main() {
 	args := os.Args[1:]
-	if len(args) == 0 || args[0] == "help" || args[0] == "-h" || args[0] == "--help" {
+	if len(args) == 0 || args[0] == "help" {
 		printUsage()
 		os.Exit(0)
 	}
 
 	switch args[0] {
 	case "extract":
-		tocPath := "GODOFWAR.TOC"
-		pak1Path := "PART1.PAK"
-		pak2Path := "PART2.PAK"
-		outDir := "UNPAK"
-		pos := 1
-		if len(args) > pos {
-			tocPath = args[pos]
-			pos++
+		if len(args) < 5 {
+			fmt.Println("Ошибка: недостаточно аргументов для extract")
+			printUsage()
+			os.Exit(1)
 		}
-		if len(args) > pos {
-			pak1Path = args[pos]
-			pos++
-		}
-		if len(args) > pos {
-			pak2Path = args[pos]
-			pos++
-		}
-		if len(args) > pos {
-			outDir = args[pos]
-		}
-		meta, err := readTOC(tocPath, pak1Path, pak2Path)
-		if err != nil {
+		tocPath := args[1]
+		pak1Path := args[2]
+		pak2Path := args[3]
+		outDir := args[4]
+		if err := extract(tocPath, pak1Path, pak2Path, outDir); err != nil {
 			log.Fatalf("Ошибка: %v", err)
 		}
-		fmt.Printf("Найдено файлов: %d\n", meta.FileCount)
-		if err := extractFiles(meta, outDir); err != nil {
-			log.Fatalf("Ошибка распаковки: %v", err)
-		}
-		if err := saveMetadata(meta, outDir); err != nil {
-			log.Fatalf("Ошибка сохранения метаданных: %v", err)
-		}
-		fmt.Printf("Распаковка завершена в %s\n", outDir)
 
 	case "pack":
-		inDir := "UNPAK"
-		outPakPath := "PART1_NEW.PAK"
-		outTocPath := "GODOFWAR_NEW.TOC"
+		if len(args) < 4 {
+			fmt.Println("Ошибка: недостаточно аргументов для pack")
+			printUsage()
+			os.Exit(1)
+		}
+		inDir := args[1]
+		outPak := args[2]
+		outToc := args[3]
+		relinkPss := false
 		dedup := false
-		relinkName := true
-		var positional []string
-		for _, arg := range args[1:] {
-			if strings.HasPrefix(arg, "-") {
-				parts := strings.SplitN(arg, "=", 2)
-				if len(parts) == 2 {
-					switch parts[0] {
-					case "-dedup":
-						dedup = parts[1] != "false"
-					case "-relinkname":
-						relinkName = parts[1] != "false"
-					}
-				} else {
-					switch arg {
-					case "-dedup":
-						dedup = true
-					case "-relinkname":
-						relinkName = true
-					}
-				}
-			} else {
-				positional = append(positional, arg)
+		for _, arg := range args[4:] {
+			if arg == "-relinkpss" {
+				relinkPss = true
+			}
+			if arg == "-dedup" {
+				dedup = true
 			}
 		}
-		if len(positional) > 0 {
-			inDir = positional[0]
-		}
-		if len(positional) > 1 {
-			outPakPath = positional[1]
-		}
-		if len(positional) > 2 {
-			outTocPath = positional[2]
-		}
-		if err := pack(inDir, outPakPath, outTocPath, dedup, relinkName); err != nil {
+		if err := pack(inDir, outPak, outToc, relinkPss, dedup); err != nil {
 			log.Fatalf("Ошибка упаковки: %v", err)
 		}
-		fmt.Printf("Упаковка завершена. Созданы: %s и %s\n", outPakPath, outTocPath)
 
 	default:
 		printUsage()
+		os.Exit(1)
 	}
 }
